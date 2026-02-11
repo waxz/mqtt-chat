@@ -32,13 +32,13 @@ import uvicorn
 # CONFIGURATION
 # ============================================================
 class Config:
-    # BROKER_HOST = os.getenv("MQTT_BROKER_HOST", "nxdev-org-mqtt-broker.hf.space")
-    # BROKER_PORT = int(os.getenv("MQTT_BROKER_PORT", "443"))
-    # USE_TLS = os.getenv("MQTT_USE_TLS", "true").lower() in ("1", "true", "yes")
+    BROKER_HOST = os.getenv("MQTT_BROKER_HOST", "nxdev-org-mqtt-broker.hf.space")
+    BROKER_PORT = int(os.getenv("MQTT_BROKER_PORT", "443"))
+    USE_TLS = os.getenv("MQTT_USE_TLS", "true").lower() in ("1", "true", "yes")
 
-    BROKER_HOST = os.getenv("MQTT_BROKER_HOST", "localhost")
-    BROKER_PORT = int(os.getenv("MQTT_BROKER_PORT", "7860"))
-    USE_TLS = os.getenv("MQTT_USE_TLS", "false").lower() in ("1", "true", "yes")
+    # BROKER_HOST = os.getenv("MQTT_BROKER_HOST", "localhost")
+    # BROKER_PORT = int(os.getenv("MQTT_BROKER_PORT", "7860"))
+    # USE_TLS = os.getenv("MQTT_USE_TLS", "false").lower() in ("1", "true", "yes")
     
     WS_PATH = os.getenv("MQTT_WS_PATH", "/mqtt")
     
