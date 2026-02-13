@@ -1,29 +1,28 @@
 #!/usr/bin/env python3
 """
-api_server.py — Enterprise-grade OpenAI-Compatible MQTT Bridge
+api_server.py — High-Performance OpenAI-Compatible MQTT Proxy (Multi-Worker Edition)
 
 Features:
-- Strict OpenAI API Spec compliance (Pydantic v2).
-- Proactive Worker Discovery (Broadcast Ping).
-- Robust Asyncio/Thread bridging.
-- Graceful handling of client disconnects and timeouts.
+- Full OpenAI Chat Completion API support.
+- Multi-Worker Discovery: Lists every active browser tab as a unique model.
+- Intelligent Routing: Routes requests to specific workers or load-balances across ready ones.
+- Enhanced Session Isolation: Handles per-tab worker sessions (Zen v9.5).
 """
 
 import json
 import time
 import uuid
 import asyncio
-import argparse
 import logging
 import os
-import threading
 from typing import Optional, List, Dict, Any, Union, Literal, AsyncGenerator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Header, Request, status
+from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 import paho.mqtt.client as mqtt
 from paho.mqtt.client import CallbackAPIVersion
 import uvicorn
@@ -35,316 +34,206 @@ class Config:
     BROKER_HOST = os.getenv("MQTT_BROKER_HOST", "nxdev-org-mqtt-broker.hf.space")
     BROKER_PORT = int(os.getenv("MQTT_BROKER_PORT", "443"))
     USE_TLS = os.getenv("MQTT_USE_TLS", "true").lower() in ("1", "true", "yes")
-
-    # BROKER_HOST = os.getenv("MQTT_BROKER_HOST", "localhost")
-    # BROKER_PORT = int(os.getenv("MQTT_BROKER_PORT", "7860"))
-    # USE_TLS = os.getenv("MQTT_USE_TLS", "false").lower() in ("1", "true", "yes")
-    
     WS_PATH = os.getenv("MQTT_WS_PATH", "/mqtt")
     
-    API_HOST = os.getenv("API_HOST", "0.0.0.0")
-    API_PORT = int(os.getenv("API_PORT", "8001"))
+    API_HOST = "0.0.0.0"
+    API_PORT = 8001
     
-    TIMEOUT_SEC = 60.0        # Max time to wait for first token
-    SESSION_EXPIRY = 120.0    # Seconds before a model is considered offline
+    TIMEOUT_SEC = 120.0
+    SESSION_EXPIRY = 30.0  # Workers must heartbeat every 2s, 30s is generous
 
 config = Config()
-logger = logging.getLogger("arena-api")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("openai-proxy")
 
 # ============================================================
-# OPENAI PYDANTIC MODELS (Strict Spec)
+# MODELS
 # ============================================================
 
 class ChatMessage(BaseModel):
     role: str
     content: str
-    name: Optional[str] = None
 
 class ChatCompletionRequest(BaseModel):
-    model: str = "auto"
+    model: str
     messages: List[ChatMessage]
-    temperature: Optional[float] = 1.0
-    top_p: Optional[float] = 1.0
-    n: Optional[int] = 1
-    stream: Optional[bool] = False
-    stop: Optional[Union[str, List[str]]] = None
-    max_tokens: Optional[int] = None
-    presence_penalty: Optional[float] = 0.0
-    frequency_penalty: Optional[float] = 0.0
-    user: Optional[str] = None
-
-# -- Responses --
+    stream: bool = False
+    temperature: float = 1.0
 
 class ChoiceDelta(BaseModel):
-    role: Optional[str] = None
     content: Optional[str] = None
-    reasoning_content: Optional[str] = None  # DeepSeek/Thinking extension
-
-class ChoiceMessage(BaseModel):
-    role: str = "assistant"
-    content: Optional[str] = ""
     reasoning_content: Optional[str] = None
 
-class Choice(BaseModel):
-    index: int
-    message: ChoiceMessage
-    finish_reason: Optional[str] = None
-
 class ChoiceChunk(BaseModel):
-    index: int
     delta: ChoiceDelta
     finish_reason: Optional[str] = None
-
-class UsageInfo(BaseModel):
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    total_tokens: int = 0
-
-class ChatCompletionResponse(BaseModel):
-    id: str
-    object: Literal["chat.completion"] = "chat.completion"
-    created: int
-    model: str
-    system_fingerprint: Optional[str] = "fp_mqtt_bridge"
-    choices: List[Choice]
-    usage: UsageInfo
+    index: int = 0
 
 class ChatCompletionChunk(BaseModel):
     id: str
-    object: Literal["chat.completion.chunk"] = "chat.completion.chunk"
+    object: str = "chat.completion.chunk"
     created: int
     model: str
-    system_fingerprint: Optional[str] = "fp_mqtt_bridge"
     choices: List[ChoiceChunk]
 
 # ============================================================
-# MQTT BRIDGE CORE
+# MQTT BRIDGE ENGINE
 # ============================================================
 
-class MQTTBridge:
+class OpenAIProxyEngine:
     def __init__(self):
-        self.client_id = f"api-srv-{uuid.uuid4().hex[:8]}"
-        self.sessions: Dict[str, Dict] = {}  # { session_id: { last_seen, host, status } }
-        
-        # Request routing: req_id -> asyncio.Queue
-        self._response_queues: Dict[str, asyncio.Queue] = {}
+        self.client_id = f"proxy-{uuid.uuid4().hex[:8]}"
+        self.workers: Dict[str, Dict] = {} # sid -> {model, status, last_seen, host}
+        self._queues: Dict[str, asyncio.Queue] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         
-        # Paho Client
-        self.client = mqtt.Client(
+        # Paho MQTT Setup
+        self.mqtt = mqtt.Client(
             callback_api_version=CallbackAPIVersion.VERSION2,
             client_id=self.client_id,
-            transport="websockets",
-            protocol=mqtt.MQTTv311,
+            transport="websockets"
         )
-        
         if config.USE_TLS:
-            self.client.tls_set()
-            
-        self.client.ws_set_options(path=config.WS_PATH, headers={"Sec-WebSocket-Protocol": "mqtt"})
-        self.client.on_connect = self._on_connect
-        self.client.on_message = self._on_message
-        self.client.on_disconnect = self._on_disconnect
+            self.mqtt.tls_set()
+        self.mqtt.ws_set_options(path=config.WS_PATH, headers={"Sec-WebSocket-Protocol": "mqtt"})
+        
+        self.mqtt.on_connect = self._on_connect
+        self.mqtt.on_message = self._on_message
 
     def set_loop(self, loop):
         self._loop = loop
 
-    def connect(self):
-        logger.info(f"🔌 Connecting to Broker: {config.BROKER_HOST}:{config.BROKER_PORT}")
-        try:
-            self.client.connect(config.BROKER_HOST, config.BROKER_PORT, keepalive=60)
-            self.client.loop_start()
-        except Exception as e:
-            logger.error(f"❌ Connection failed: {e}")
-            raise e
-
-    def disconnect(self):
-        self.client.loop_stop()
-        self.client.disconnect()
-
-    # --- MQTT Callbacks (Threaded) ---
-
     def _on_connect(self, client, userdata, flags, rc, props=None):
         if rc == 0:
-            logger.info("✅ MQTT Connected. Subscribing to heartbeats...")
-            client.subscribe("arena-ai/+/response")        # Listen for all worker responses
-            client.subscribe("arena-ai/global/heartbeat")  # Listen for worker presence
-            
-            # PROACTIVE DISCOVERY: Tell all workers to announce themselves immediately
-            self.client.publish("arena-ai/global/discovery", "ping", retain=False)
+            logger.info("✅ Proxy connected to MQTT broker")
+            client.subscribe("arena-ai/+/response")
+            client.subscribe("arena-ai/global/heartbeat")
+            client.publish("arena-ai/global/discovery", "ping")
         else:
-            logger.error(f"❌ MQTT Connect Failed. RC={rc}")
-
-    def _on_disconnect(self, client, userdata, flags, rc, props=None):
-        logger.warning(f"⚠️ MQTT Disconnected (RC={rc})")
+            logger.error(f"❌ MQTT Connection failed: {rc}")
 
     def _on_message(self, client, userdata, msg):
         try:
             topic = msg.topic
             payload = json.loads(msg.payload.decode())
 
-            # 1. Heartbeat Handling
             if topic == "arena-ai/global/heartbeat":
-                print(f"⚠️ Get heartbeat payload:{payload}")
                 sid = payload.get("id")
                 if sid:
-                    status = {
+                    self.workers[sid] = {
                         "last_seen": time.time(),
-                        "host": payload.get("host", "unknown"),
+                        "model": payload.get("model", "AI-Worker"),
                         "status": payload.get("status", "ready"),
-                        "model": payload.get("model", sid)
+                        "host": payload.get("host", "unknown")
                     }
-                    print(f"⚠️ Update sessions sid:{sid}, status:{status}")
-                    self.sessions[sid] = status
                 return
 
-            # 2. Response Handling
-            # Topic format: arena-ai/{session_id}/response
             if topic.endswith("/response"):
-                req_id = payload.get("id")
-                if req_id and req_id in self._response_queues:
-                    # Thread-safe put into asyncio queue
-                    if self._loop:
-                        self._loop.call_soon_threadsafe(
-                            self._response_queues[req_id].put_nowait, payload
-                        )
-                        
+                rid = payload.get("id")
+                if rid in self._queues and self._loop:
+                    self._loop.call_soon_threadsafe(self._queues[rid].put_nowait, payload)
         except Exception as e:
-            logger.error(f"Message processing error: {e}")
+            logger.error(f"Error processing MQTT message: {e}")
 
-    # --- Async API Methods ---
-
-    def get_active_models(self) -> List[Dict]:
-        """Return list of models seen in the last SESSION_EXPIRY seconds."""
+    def get_active_workers(self):
         now = time.time()
-        active = []
-        # Filter stale sessions
-        stale_ids = []
-        for sid, info in self.sessions.items():
-            if now - info["last_seen"] > config.SESSION_EXPIRY:
-                stale_ids.append(sid)
+        active = {}
+        for sid, info in list(self.workers.items()):
+            if now - info["last_seen"] < config.SESSION_EXPIRY:
+                active[sid] = info
             else:
-                active.append({
-                    "id": sid,
-                    "object": "model",
-                    "created": int(info["last_seen"]),
-                    "owned_by": info["host"]
-                })
-        
-        # Cleanup stale
-        for sid in stale_ids:
-            del self.sessions[sid]
-            
+                del self.workers[sid]
         return active
 
-    async def send_chat_request(self, req: ChatCompletionRequest) -> AsyncGenerator[Dict, None]:
-        """
-        Orchestrates the request:
-        1. Selects Model
-        2. Publishes MQTT Request
-        3. Listens for MQTT Responses
-        4. Yields chunks (or full response)
-        """
-        # 1. Resolve Model
-        target_session = self._resolve_session(req.model)
-        
-        # 2. Prepare Request
-        req_id = uuid.uuid4().hex
-        response_queue = asyncio.Queue()
-        self._response_queues[req_id] = response_queue
+    async def chat(self, req: ChatCompletionRequest) -> AsyncGenerator[Dict, None]:
+        active = self.get_active_workers()
+        target_sid = None
 
+        # 1. Try exact SID match
+        if req.model in active:
+            target_sid = req.model
+        # 2. Try "Model:SID" format match
+        elif ":" in req.model:
+            parts = req.model.split(":")
+            potential_sid = parts[-1]
+            if potential_sid in active:
+                target_sid = potential_sid
+        
+        # 3. Fallback: Find worker by model name
+        if not target_sid:
+            candidates = [sid for sid, info in active.items() if info["model"] == req.model and info["status"] == "ready"]
+            if candidates:
+                target_sid = candidates[0]
+        
+        # 4. Final Fallback: First ready worker
+        if not target_sid:
+            ready = [sid for sid, info in active.items() if info["status"] == "ready"]
+            if not ready:
+                logger.error("❌ No active Zen workers available")
+                raise HTTPException(status_code=503, detail="No active Zen Bridge workers found")
+            target_sid = ready[0]
+
+        req_id = f"req-{uuid.uuid4().hex[:12]}"
+        q = asyncio.Queue()
+        self._queues[req_id] = q
+        
         mqtt_payload = {
             "id": req_id,
             "messages": [m.model_dump() for m in req.messages],
             "stream": req.stream,
-            "temperature": req.temperature,
-            # Pass other params if needed
+            "temperature": req.temperature
         }
-        
-        topic = f"arena-ai/{target_session}/request"
-        logger.info(f"📤 Routing request {req_id[:6]} -> {target_session}")
+
+        logger.info(f"📤 [OpenAI] Start {req_id} -> Worker {target_sid} ({active[target_sid]['model']})")
 
         try:
-            # Publish (Non-blocking)
-            self.client.publish(topic, json.dumps(mqtt_payload), qos=1)
+            self.mqtt.publish(f"arena-ai/{target_sid}/request", json.dumps(mqtt_payload), qos=1)
             
-            # 3. Wait for Responses
-            start_time = time.time()
-            first_packet = True
-            
+            start = time.time()
+            chunk_count = 0
             while True:
-                # Calculate Timeout
-                elapsed = time.time() - start_time
-                remaining = config.TIMEOUT_SEC - elapsed
+                if time.time() - start > config.TIMEOUT_SEC:
+                    logger.warning(f"⏰ {req_id} timed out")
+                    raise asyncio.TimeoutError()
                 
-                if remaining <= 0:
-                    raise HTTPException(status_code=504, detail="Worker timed out waiting for response")
-
-                try:
-                    # Wait for next chunk
-                    raw_msg = await asyncio.wait_for(response_queue.get(), timeout=remaining)
-                except asyncio.TimeoutError:
-                     raise HTTPException(status_code=504, detail="Worker timed out")
-
-                # Check for worker-side errors
-                if "error" in raw_msg:
-                    raise HTTPException(status_code=502, detail=f"Worker Error: {raw_msg['error']}")
-
-                # Yield logic
-                yield raw_msg
+                chunk = await q.get()
+                chunk_count += 1
+                yield chunk
                 
-                # Check for done
-                choices = raw_msg.get("choices", [])
+                choices = chunk.get("choices", [])
+                is_done = False
                 if choices and choices[0].get("finish_reason"):
+                    is_done = True
+                elif chunk.get("object") == "chat.completion":
+                    is_done = True
+                
+                if is_done:
+                    while not q.empty():
+                        extra = q.get_nowait()
+                        yield extra
+                        chunk_count += 1
+                    logger.info(f"✅ [OpenAI] End {req_id} ({chunk_count} chunks)")
                     break
-                    
-                # Standardize object type check
-                if raw_msg.get("object") == "chat.completion":
-                    break
-
         finally:
-            # Cleanup
-            if req_id in self._response_queues:
-                del self._response_queues[req_id]
-
-    def _resolve_session(self, model_name: str) -> str:
-        # 1. Exact Match (Session ID)
-        if model_name in self.sessions:
-            return model_name
-            
-        # 2. "auto" or empty -> Pick any active
-        active = self.get_active_models()
-        if not active:
-             raise HTTPException(status_code=503, detail="No active workers found. Please open the UserScript.")
-             
-        if model_name in ["auto", "default", "gpt-3.5-turbo"]:
-            return active[0]["id"]
-            
-        # 3. Search by partial name (if worker sends friendly model name)
-        # (Simplified: just assuming model_name == session_id for now)
-        raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found.")
+            if req_id in self._queues:
+                del self._queues[req_id]
 
 # ============================================================
-# FASTAPI APP
+# API SERVER
 # ============================================================
 
-bridge = MQTTBridge()
+engine = OpenAIProxyEngine()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
-    print(f"🚀 Starting API Server on {config.API_HOST}:{config.API_PORT}")
-    print(f"🔗 Bridging to MQTT: {config.BROKER_HOST}")
-    
-    bridge.set_loop(asyncio.get_running_loop())
-    bridge.connect()
-    logger.info("🚀 API Server Started")
+    engine.set_loop(asyncio.get_running_loop())
+    engine.mqtt.connect(config.BROKER_HOST, config.BROKER_PORT)
+    engine.mqtt.loop_start()
     yield
-    # Shutdown
-    bridge.disconnect()
-    logger.info("👋 API Server Stopped")
+    engine.mqtt.loop_stop()
+    engine.mqtt.disconnect()
 
-app = FastAPI(title="MQTT OpenAI Bridge", version="2.0", lifespan=lifespan)
+app = FastAPI(title="Zen OpenAI Proxy", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -352,160 +241,93 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-@app.get("/")
-async def root():
-    return {"message": "AI MQTT Bridge" }
 
-# --- Exception Handler for OpenAI format ---
-@app.exception_handler(HTTPException)
-async def openai_exception_handler(request: Request, exc: HTTPException):
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={
-            "error": {
-                "message": exc.detail,
-                "type": "api_error",
-                "param": None,
-                "code": exc.status_code
-            }
-        }
-    )
 
-# ============================================================
-# ENDPOINTS
-# ============================================================
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return "High-Performance OpenAI-Compatible MQTT Proxy (Multi-Worker Edition)"
+
 
 @app.get("/v1/models")
-async def list_models():
-    return {"object": "list", "data": bridge.get_active_models()}
-
-@app.get("/health")
-async def health():
-    return {
-        "status": "ok", 
-        "mqtt": bridge.client.is_connected(),
-        "workers": len(bridge.sessions)
-    }
+async def models():
+    active = engine.get_active_workers()
+    data = []
+    
+    # Add a generic "auto" model
+    data.append({"id": "auto", "object": "model", "owned_by": "zen-bridge"})
+    
+    for sid, info in active.items():
+        # Represent each session as a model: "ModelName:SID"
+        model_id = f"{info['model']}:{sid}"
+        data.append({
+            "id": model_id,
+            "object": "model",
+            "owned_by": "zen-bridge",
+            "meta": {
+                "sid": sid,
+                "status": info["status"],
+                "host": info["host"]
+            }
+        })
+    return {"object": "list", "data": data}
 
 @app.post("/v1/chat/completions")
-async def chat_completions(req: ChatCompletionRequest, request: Request):
-    
-    # Generate authoritative ID for this interaction
-    chat_id = f"chatcmpl-{uuid.uuid4().hex}"
-    created_ts = int(time.time())
+async def chat(req: ChatCompletionRequest, request: Request):
+    chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created = int(time.time())
 
-    # --- Streaming Response ---
     if req.stream:
-        async def generator():
+        async def stream_gen():
             try:
-                async for raw_chunk in bridge.send_chat_request(req):
+                async for chunk in engine.chat(req):
                     if await request.is_disconnected():
-                        logger.info("Client disconnected, stopping stream")
                         break
                     
-                    # Convert raw worker JSON to Pydantic strict format
-                    # Worker sends: { choices: [{ delta: { content: "x" } }] }
-                    # We need to ensure fields exist
+                    choices = chunk.get("choices", [])
+                    if not choices: continue
+                    delta_data = choices[0].get("delta", {}) or choices[0].get("message", {})
                     
-                    worker_choices = raw_chunk.get("choices", [])
-                    delta = {}
-                    finish_reason = None
-                    
-                    if worker_choices:
-                        delta = worker_choices[0].get("delta", {}) or worker_choices[0].get("message", {})
-                        finish_reason = worker_choices[0].get("finish_reason")
-
-                    chunk_resp = ChatCompletionChunk(
-                        id=chat_id,
-                        created=created_ts,
-                        model=req.model,
-                        choices=[
-                            ChoiceChunk(
-                                index=0,
-                                delta=ChoiceDelta(
-                                    content=delta.get("content"),
-                                    reasoning_content=delta.get("reasoning_content"),
-                                    role=delta.get("role") if delta.get("role") else None
-                                ),
-                                finish_reason=finish_reason
-                            )
-                        ]
+                    resp = ChatCompletionChunk(
+                        id=chat_id, created=created, model=req.model,
+                        choices=[ChoiceChunk(
+                            delta=ChoiceDelta(
+                                content=delta_data.get("content"),
+                                reasoning_content=delta_data.get("reasoning_content")
+                            ),
+                            finish_reason=choices[0].get("finish_reason")
+                        )]
                     )
-                    
-                    yield f"data: {chunk_resp.model_dump_json(exclude_none=True)}\n\n"
-                    
-                    if finish_reason:
-                        yield "data: [DONE]\n\n"
-                        break
-                        
-            except HTTPException as e:
-                # If streaming started, we can't easily change status code, 
-                # but we can send an error object in the stream
-                err_payload = json.dumps({"error": {"message": e.detail, "code": e.status_code}})
-                yield f"data: {err_payload}\n\n"
-            except Exception as e:
-                logger.error(f"Stream error: {e}")
+                    yield f"data: {resp.model_dump_json(exclude_none=True)}\n\n"
                 
-        return StreamingResponse(generator(), media_type="text/event-stream")
-
-    # --- Non-Streaming Response (Buffered) ---
+                if not await request.is_disconnected():
+                    yield "data: [DONE]\n\n"
+            except Exception as e:
+                logger.error(f"Stream Error: {e}")
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        
+        return StreamingResponse(stream_gen(), media_type="text/event-stream")
+    
     else:
         full_content = ""
         full_reasoning = ""
-        finish_reason = "stop"
-        
-        async for raw_chunk in bridge.send_chat_request(req):
-            if await request.is_disconnected():
-                raise HTTPException(499, "Client Closed Request")
-
-            # Handle both "stream-like" chunks and "full" responses from worker
-            choices = raw_chunk.get("choices", [])
+        async for chunk in engine.chat(req):
+            choices = chunk.get("choices", [])
             if not choices: continue
-            
-            delta = choices[0].get("delta", {}) or choices[0].get("message", {})
-            
-            if "content" in delta and delta["content"]:
-                full_content += delta["content"]
-            if "reasoning_content" in delta and delta["reasoning_content"]:
-                full_reasoning += delta["reasoning_content"]
-                
-            if choices[0].get("finish_reason"):
-                finish_reason = choices[0].get("finish_reason")
+            delta_data = choices[0].get("delta", {}) or choices[0].get("message", {})
+            full_content += delta_data.get("content", "") or ""
+            full_reasoning += delta_data.get("reasoning_content", "") or ""
+        
+        return {
+            "id": chat_id, "object": "chat.completion", "created": created, "model": req.model,
+            "choices": [{
+                "message": {
+                    "role": "assistant", 
+                    "content": full_content, 
+                    "reasoning_content": full_reasoning if full_reasoning else None
+                },
+                "finish_reason": "stop", "index": 0
+            }]
+        }
 
-        return ChatCompletionResponse(
-            id=chat_id,
-            created=created_ts,
-            model=req.model,
-            choices=[
-                Choice(
-                    index=0,
-                    message=ChoiceMessage(
-                        role="assistant",
-                        content=full_content,
-                        reasoning_content=full_reasoning if full_reasoning else None
-                    ),
-                    finish_reason=finish_reason
-                )
-            ],
-            usage=UsageInfo(
-                completion_tokens=len(full_content) // 4, # Rough estimate
-                prompt_tokens=len(str(req.messages)) // 4,
-                total_tokens=0
-            )
-        )
-
-# ============================================================
-# MAIN
-# ============================================================
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    
-    print(f"🚀 Starting API Server on {config.API_HOST}:{config.API_PORT}")
-    print(f"🔗 Bridging to MQTT: {config.BROKER_HOST}")
-    
-    uvicorn.run(
-        app, 
-        host=config.API_HOST, 
-        port=config.API_PORT,
-        log_level="info"
-    )
+    uvicorn.run(app, host=config.API_HOST, port=config.API_PORT)
