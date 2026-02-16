@@ -1030,6 +1030,19 @@ async def list_models():
         })
     return {"object": "list", "data": data}
 
+@app.options("/v1/chat/completions")
+async def options_chat_completions():
+    return Response(
+        status_code=200,
+        headers={
+            "Allow": "POST, OPTIONS",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        },
+    )
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request):
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
